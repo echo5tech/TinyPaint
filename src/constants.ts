@@ -1,4 +1,4 @@
-import { LucideIcon, Paintbrush, Eraser, PaintBucket, Undo2, Redo2, Download, Trash2, Smile, Shapes, Hand, FlipHorizontal, ImagePlus, FolderOpen } from 'lucide-react';
+import { Eraser, Hand, LucideIcon, Paintbrush, PaintBucket, Shapes, Smile } from 'lucide-react';
 
 export type ToolType = 'brush' | 'eraser' | 'bucket' | 'sticker' | 'shape' | 'move';
 

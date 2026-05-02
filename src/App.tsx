@@ -13,6 +13,122 @@ interface HistoryState {
   imageData: ImageData;
 }
 
+const HISTORY_LIMIT = 20;
+const GALLERY_STORAGE_KEY = 'tinypaint-gallery';
+const GALLERY_LIMIT = 12;
+const MAX_GALLERY_IMAGE_SIZE = 1200;
+
+const fillCanvasWhite = (ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) => {
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+};
+
+const drawImageCentered = (
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  image: HTMLCanvasElement | HTMLImageElement,
+) => {
+  const sourceWidth = image instanceof HTMLImageElement ? image.naturalWidth || image.width : image.width;
+  const sourceHeight = image instanceof HTMLImageElement ? image.naturalHeight || image.height : image.height;
+  if (sourceWidth <= 0 || sourceHeight <= 0) return;
+
+  const scale = Math.min(canvas.width / sourceWidth, canvas.height / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+  const x = (canvas.width - width) / 2;
+  const y = (canvas.height - height) / 2;
+
+  ctx.drawImage(image, x, y, width, height);
+};
+
+const createCanvasSnapshot = (canvas: HTMLCanvasElement) => {
+  if (canvas.width <= 0 || canvas.height <= 0) return null;
+
+  const snapshot = document.createElement('canvas');
+  snapshot.width = canvas.width;
+  snapshot.height = canvas.height;
+  const snapshotCtx = snapshot.getContext('2d');
+  if (!snapshotCtx) return null;
+
+  snapshotCtx.drawImage(canvas, 0, 0);
+  return snapshot;
+};
+
+const resizeImageData = (imageData: ImageData, width: number, height: number) => {
+  const source = document.createElement('canvas');
+  source.width = imageData.width;
+  source.height = imageData.height;
+  const sourceCtx = source.getContext('2d');
+  if (!sourceCtx) return imageData;
+  sourceCtx.putImageData(imageData, 0, 0);
+
+  const target = document.createElement('canvas');
+  target.width = width;
+  target.height = height;
+  const targetCtx = target.getContext('2d', { willReadFrequently: true });
+  if (!targetCtx) return imageData;
+
+  fillCanvasWhite(targetCtx, target);
+  drawImageCentered(targetCtx, target, source);
+  return targetCtx.getImageData(0, 0, width, height);
+};
+
+const readSavedArtworks = () => {
+  try {
+    const saved = localStorage.getItem(GALLERY_STORAGE_KEY);
+    if (!saved) return [];
+
+    const parsed: unknown = JSON.parse(saved);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch (error) {
+    console.warn('Unable to read saved TinyPaint gallery.', error);
+    return [];
+  }
+};
+
+const writeSavedArtworks = (artworks: string[]) => {
+  try {
+    localStorage.setItem(GALLERY_STORAGE_KEY, JSON.stringify(artworks));
+    return true;
+  } catch (error) {
+    console.warn('Unable to save TinyPaint gallery.', error);
+    return false;
+  }
+};
+
+const createGalleryImage = (canvas: HTMLCanvasElement) => {
+  const scale = Math.min(1, MAX_GALLERY_IMAGE_SIZE / Math.max(canvas.width, canvas.height));
+  const preview = document.createElement('canvas');
+  preview.width = Math.max(1, Math.round(canvas.width * scale));
+  preview.height = Math.max(1, Math.round(canvas.height * scale));
+
+  const previewCtx = preview.getContext('2d');
+  if (!previewCtx) return canvas.toDataURL('image/jpeg', 0.75);
+
+  fillCanvasWhite(previewCtx, preview);
+  previewCtx.drawImage(canvas, 0, 0, preview.width, preview.height);
+  return preview.toDataURL('image/jpeg', 0.75);
+};
+
+const getColorLabel = (color: string) => {
+  if (color === 'RAINBOW') return 'Rainbow';
+
+  const colorNames: Record<string, string> = {
+    '#FF595E': 'Red',
+    '#FF924C': 'Orange',
+    '#FFCA3A': 'Yellow',
+    '#8AC926': 'Green',
+    '#1982C4': 'Blue',
+    '#6A4C93': 'Purple',
+    '#F038FF': 'Pink',
+    '#000000': 'Black',
+    '#FFFFFF': 'White',
+    '#4E342E': 'Brown',
+  };
+
+  return colorNames[color] ?? color;
+};
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -24,13 +140,14 @@ export default function App() {
   const [isDrawing, setIsDrawing] = useState(false);
   const [history, setHistory] = useState<HistoryState[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const historyIndexRef = useRef(historyIndex);
+  const historyStatesRef = useRef<HistoryState[]>([]);
   const [selectedSticker, setSelectedSticker] = useState<string | null>(null);
   const [showStickers, setShowStickers] = useState(false);
   const [showTemplates, setShowTemplates] = useState(false);
   const [showShapes, setShowShapes] = useState(false);
   const [currentShape, setCurrentShape] = useState<ShapeType>('circle');
   const [startPos, setStartPos] = useState({ x: 0, y: 0 });
-  const [snapshot, setSnapshot] = useState<ImageData | null>(null);
   const [placingSticker, setPlacingSticker] = useState<{char: string, x: number, y: number, scale: number} | null>(null);
   const [placingShape, setPlacingShape] = useState<{type: ShapeType, x: number, y: number, width: number, height: number} | null>(null);
   const [hue, setHue] = useState(0);
@@ -39,6 +156,7 @@ export default function App() {
   const [isSymmetry, setIsSymmetry] = useState(false);
   const [showGallery, setShowGallery] = useState(false);
   const [savedArtworks, setSavedArtworks] = useState<string[]>([]);
+  const [galleryError, setGalleryError] = useState<string | null>(null);
   const lastPos = useRef({ x: 0, y: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -63,12 +181,12 @@ export default function App() {
     return { x, y };
   };
   useEffect(() => {
-    if (currentColor === 'RAINBOW') {
-      const interval = setInterval(() => {
-        setHue(h => (h + 5) % 360);
-      }, 50);
-      return () => clearInterval(interval);
-    }
+    if (currentColor !== 'RAINBOW') return undefined;
+
+    const interval = setInterval(() => {
+      setHue(h => (h + 5) % 360);
+    }, 50);
+    return () => clearInterval(interval);
   }, [currentColor]);
 
   // Initialize canvas
@@ -78,34 +196,42 @@ export default function App() {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
-    // Load gallery
-    const loadedArt = localStorage.getItem('tinypaint-gallery');
-    if (loadedArt) {
-      try {
-        setSavedArtworks(JSON.parse(loadedArt));
-      } catch (e) {}
-    }
+    setSavedArtworks(readSavedArtworks());
 
     const resizeCanvas = () => {
       const container = containerRef.current;
       if (!container) return;
-  
-      // Save current content before resizing
-      const tempImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  
+
       const { width, height } = container.getBoundingClientRect();
-      canvas.width = width;
-      canvas.height = height;
-  
-      // Fill with white initially and restore content if history exists
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-  
-      if (historyIndex >= 0) {
-        // Restore the image data from the last saved state
-        ctx.putImageData(tempImageData, 0, 0);
+      const nextWidth = Math.max(1, Math.round(width));
+      const nextHeight = Math.max(1, Math.round(height));
+      const sameSize = canvas.width === nextWidth && canvas.height === nextHeight;
+
+      if (sameSize && historyStatesRef.current.length > 0) return;
+
+      const currentSnapshot = createCanvasSnapshot(canvas);
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
+      fillCanvasWhite(ctx, canvas);
+
+      if (historyStatesRef.current.length > 0 && historyIndexRef.current >= 0) {
+        const resizedHistory = historyStatesRef.current.map(({ imageData }) => ({
+          imageData: resizeImageData(imageData, nextWidth, nextHeight),
+        }));
+        const nextIndex = Math.min(historyIndexRef.current, resizedHistory.length - 1);
+
+        if (resizedHistory[nextIndex]) {
+          ctx.putImageData(resizedHistory[nextIndex].imageData, 0, 0);
+        }
+
+        historyStatesRef.current = resizedHistory;
+        historyIndexRef.current = nextIndex;
+        setHistory(resizedHistory);
+        setHistoryIndex(nextIndex);
       } else {
-        // If no history, just fill with white and save this initial blank state
+        if (currentSnapshot) {
+          drawImageCentered(ctx, canvas, currentSnapshot);
+        }
         saveToHistory();
       }
     };
@@ -115,9 +241,6 @@ export default function App() {
     return () => window.removeEventListener('resize', resizeCanvas);
   }, []);
 
-  // Use a ref to track the current history index so it's not stale in useCallback dependencies
-  const historyRef = useRef(historyIndex);
-
   const saveToHistory = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -126,21 +249,24 @@ export default function App() {
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const newState: HistoryState = { imageData };
+    const currentIndex = historyIndexRef.current;
+    const nextIndex = Math.min(currentIndex + 1, HISTORY_LIMIT - 1);
 
     setHistory(prev => {
-      // Use the current index from the ref for slicing
-      const sliced = prev.slice(0, historyRef.current + 1);
-      return [...sliced, newState].slice(-20); // Keep last 20 steps
+      const sliced = prev.slice(0, currentIndex + 1);
+      const nextHistory = [...sliced, newState].slice(-HISTORY_LIMIT);
+      historyStatesRef.current = nextHistory;
+      return nextHistory;
     });
-    
-    // Update the ref and set the new index state
-    historyRef.current = Math.min(historyRef.current + 1, 19);
-    setHistoryIndex(historyRef.current);
+
+    historyIndexRef.current = nextIndex;
+    setHistoryIndex(nextIndex);
   }, []);
 
   const undo = () => {
     if (historyIndex <= 0) return;
     const newIndex = historyIndex - 1;
+    historyIndexRef.current = newIndex;
     setHistoryIndex(newIndex);
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
@@ -152,6 +278,7 @@ export default function App() {
   const redo = () => {
     if (historyIndex >= history.length - 1) return;
     const newIndex = historyIndex + 1;
+    historyIndexRef.current = newIndex;
     setHistoryIndex(newIndex);
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
@@ -164,8 +291,7 @@ export default function App() {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (canvas && ctx) {
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      fillCanvasWhite(ctx, canvas);
       saveToHistory();
     }
   };
@@ -176,7 +302,6 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const rect = canvas.getBoundingClientRect();
     const { x, y } = getCanvasCoords(e);
     const clientX = ('touches' in e) ? e.touches[0].clientX : e.clientX;
     const clientY = ('touches' in e) ? e.touches[0].clientY : e.clientY;
@@ -387,7 +512,6 @@ export default function App() {
     setIsPanning(false);
     if (isDrawing) {
       setIsDrawing(false);
-      setSnapshot(null);
 
       // If we were drawing a shape and it's tiny, just cancel it
       if (currentTool === 'shape' && placingShape) {
@@ -575,7 +699,7 @@ export default function App() {
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
 
-    clearCanvas();
+    fillCanvasWhite(ctx, canvas);
     ctx.strokeStyle = '#000000';
     ctx.lineWidth = 4;
     ctx.lineCap = 'round';
@@ -637,17 +761,8 @@ export default function App() {
         const ctx = canvas?.getContext('2d');
         if (!canvas || !ctx) return;
         
-        // Clear logic for importing image
-        clearCanvas();
-        
-        // Scale to fit
-        const scale = Math.min(canvas.width / img.width, canvas.height / img.height) * 0.9;
-        const w = img.width * scale;
-        const h = img.height * scale;
-        const x = (canvas.width - w) / 2;
-        const y = (canvas.height - h) / 2;
-        
-        ctx.drawImage(img, x, y, w, h);
+        fillCanvasWhite(ctx, canvas);
+        drawImageCentered(ctx, canvas, img);
         saveToHistory();
       };
       img.src = event.target?.result as string;
@@ -659,12 +774,11 @@ export default function App() {
   const saveToGallery = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const url = canvas.toDataURL('image/jpeg', 0.8);
-    const newGallery = [url, ...savedArtworks].slice(0, 12); // Keep last 12
+    const url = createGalleryImage(canvas);
+    const newGallery = [url, ...savedArtworks].slice(0, GALLERY_LIMIT);
     setSavedArtworks(newGallery);
-    localStorage.setItem('tinypaint-gallery', JSON.stringify(newGallery));
-    
-    // Confetti effect for saving
+    setGalleryError(writeSavedArtworks(newGallery) ? null : 'Gallery storage is full. Your drawing was saved for this session only.');
+
     confetti({
       particleCount: 80,
       spread: 60,
@@ -703,6 +817,7 @@ export default function App() {
           Tiny<span className="text-pink-500">Paint</span>
           <button 
             onClick={() => setShowGallery(true)}
+            aria-label="Open art gallery"
             className="ml-2 sm:ml-4 p-2 sm:px-4 sm:py-2 bg-pink-100 text-pink-600 rounded-2xl hover:bg-pink-200 active:scale-95 transition-all flex items-center gap-2 text-sm sm:text-base font-bold"
           >
             <FolderOpen size={20} />
@@ -713,6 +828,7 @@ export default function App() {
         <div className="flex gap-1 sm:gap-2 overflow-x-auto items-center">
           <button 
             onClick={() => fileInputRef.current?.click()}
+            aria-label="Import photo"
             className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-blue-500 flex items-center gap-1 sm:gap-2"
             title="Import Photo"
           >
@@ -722,6 +838,8 @@ export default function App() {
           
           <button 
             onClick={() => setIsSymmetry(!isSymmetry)}
+            aria-label="Toggle mirror symmetry"
+            aria-pressed={isSymmetry}
             className={`p-2 sm:p-3 border-2 rounded-2xl active:scale-95 transition-all flex items-center gap-1 sm:gap-2 ${
               isSymmetry ? 'bg-purple-100 border-purple-200 text-purple-600' : 'bg-white border-gray-100 hover:bg-gray-50 text-gray-700'
             }`}
@@ -735,6 +853,7 @@ export default function App() {
           
           <button 
             onClick={() => setShowTemplates(true)}
+            aria-label="Open coloring pages"
             className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-gray-700 flex items-center gap-1 sm:gap-2"
             title="Templates"
           >
@@ -745,6 +864,7 @@ export default function App() {
           <div className="hidden lg:flex bg-gray-50 rounded-2xl p-1 gap-1">
             <button 
               onClick={() => setViewScale(prev => Math.min(prev + 0.2, 5))}
+              aria-label="Zoom in"
               className="p-2 hover:bg-white rounded-xl text-gray-600 transition-colors"
               title="Zoom In"
             >
@@ -752,6 +872,7 @@ export default function App() {
             </button>
             <button 
               onClick={() => setViewScale(prev => Math.max(prev - 0.2, 0.5))}
+              aria-label="Zoom out"
               className="p-2 hover:bg-white rounded-xl text-gray-600 transition-colors"
               title="Zoom Out"
             >
@@ -759,6 +880,7 @@ export default function App() {
             </button>
             <button 
               onClick={() => { setViewScale(1); setViewOffset({ x: 0, y: 0 }); }}
+              aria-label="Reset zoom and pan"
               className="p-2 hover:bg-white rounded-xl text-gray-600 transition-colors"
               title="Reset View"
             >
@@ -768,20 +890,25 @@ export default function App() {
           <div className="h-full w-[1px] bg-gray-200 mx-1" />
           <button 
             onClick={undo}
-            className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-gray-700"
+            aria-label="Undo"
+            disabled={historyIndex <= 0}
+            className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
             title="Undo"
           >
             <Undo2 size={20} className="sm:w-6 sm:h-6" />
           </button>
           <button 
             onClick={redo}
-            className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-gray-700"
+            aria-label="Redo"
+            disabled={historyIndex >= history.length - 1}
+            className="p-2 sm:p-3 bg-white border-2 border-gray-100 rounded-2xl hover:bg-gray-50 active:scale-95 transition-all text-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
             title="Redo"
           >
             <Redo2 size={20} className="sm:w-6 sm:h-6" />
           </button>
           <button 
             onClick={clearCanvas}
+            aria-label="Clear canvas"
             className="p-2 sm:p-3 bg-white border-2 border-red-50 rounded-2xl hover:bg-red-50 active:scale-95 transition-all text-red-400 sm:ml-2"
             title="Clear all"
           >
@@ -790,6 +917,7 @@ export default function App() {
           <div className="h-full w-[1px] bg-gray-200 mx-1" />
           <button 
             onClick={() => { saveToGallery(); downloadImage('png'); }}
+            aria-label="Save drawing"
             className="p-2 sm:p-3 bg-indigo-500 text-white rounded-2xl hover:bg-indigo-600 active:scale-95 transition-all flex items-center gap-1 sm:gap-2 font-bold px-3 sm:px-5"
           >
             <Download size={20} />
@@ -812,6 +940,8 @@ export default function App() {
                 if (tool.id === 'shape') setShowShapes(true);
                 else setShowShapes(false);
               }}
+              aria-label={`Select ${tool.label.toLowerCase()} tool`}
+              aria-pressed={currentTool === tool.id}
               className={`p-4 rounded-3xl transition-all relative ${
                 currentTool === tool.id 
                   ? 'bg-yellow-400 text-white shadow-lg scale-110' 
@@ -842,6 +972,8 @@ export default function App() {
           >
             <canvas
               ref={canvasRef}
+              aria-label="Drawing canvas"
+              role="img"
               onMouseDown={startDrawing}
               onMouseMove={draw}
               onMouseUp={stopDrawing}
@@ -899,12 +1031,14 @@ export default function App() {
                     <div className="absolute -top-16 left-1/2 -translate-x-1/2 bg-white rounded-full shadow-xl p-1 flex items-center gap-2 border border-gray-100 pointer-events-auto">
                       <button 
                         onClick={finalizeShape}
+                        aria-label="Place shape"
                         className="w-10 h-10 bg-green-500 text-white rounded-full flex items-center justify-center hover:bg-green-600 transition-colors"
                       >
                         ✓
                       </button>
                       <button 
                          onClick={() => setPlacingShape(null)}
+                         aria-label="Cancel shape"
                          className="w-10 h-10 bg-red-400 text-white rounded-full flex items-center justify-center hover:bg-red-500 transition-colors"
                       >
                         ✕
@@ -954,6 +1088,7 @@ export default function App() {
                     <div className="flex-1 px-4">
                       <input 
                         type="range"
+                        aria-label="Sticker size"
                         min="0.5"
                         max="3"
                         step="0.1"
@@ -964,12 +1099,14 @@ export default function App() {
                     </div>
                     <button 
                       onClick={finalizeSticker}
+                      aria-label="Place sticker"
                       className="w-10 h-10 bg-green-500 text-white rounded-full flex items-center justify-center hover:bg-green-600 transition-colors"
                     >
                       <motion.div whileHover={{ scale: 1.2 }}>✓</motion.div>
                     </button>
                     <button 
                       onClick={() => setPlacingSticker(null)}
+                      aria-label="Cancel sticker"
                       className="w-10 h-10 bg-red-400 text-white rounded-full flex items-center justify-center hover:bg-red-500 transition-colors"
                     >
                       <motion.div whileHover={{ scale: 1.2 }}>✕</motion.div>
@@ -997,6 +1134,8 @@ export default function App() {
                       setShowStickers(false);
                       setCurrentTool('sticker');
                     }}
+                    aria-label={`Choose ${sticker} sticker`}
+                    aria-pressed={selectedSticker === sticker}
                     className={`text-4xl hover:scale-125 transition-transform flex-shrink-0 p-2 rounded-2xl ${selectedSticker === sticker ? 'bg-yellow-200' : 'hover:bg-white'}`}
                   >
                     {sticker}
@@ -1032,6 +1171,8 @@ export default function App() {
                         setShowShapes(false);
                         setCurrentTool('shape');
                       }}
+                      aria-label={`Choose ${shape} shape`}
+                      aria-pressed={currentShape === shape}
                       className={`p-4 rounded-2xl hover:bg-white hover:scale-110 transition-all flex-shrink-0 ${currentShape === shape ? 'bg-yellow-100 shadow-inner' : ''}`}
                     >
                       <span className="text-4xl">{icons[shape]}</span>
@@ -1058,14 +1199,18 @@ export default function App() {
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.9 }}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="templates-title"
                   className="bg-white p-8 rounded-[40px] shadow-2xl relative z-40 max-w-lg w-full"
                 >
-                  <h2 className="text-2xl font-black mb-6 text-center text-gray-800">Pick a page to color!</h2>
+                  <h2 id="templates-title" className="text-2xl font-black mb-6 text-center text-gray-800">Pick a page to color!</h2>
                   <div className="grid grid-cols-2 gap-4">
                     {TEMPLATES.map(tmpl => (
                       <button
                         key={tmpl.id}
                         onClick={() => loadTemplate(tmpl.id)}
+                        aria-label={`Load ${tmpl.label.toLowerCase()} coloring page`}
                         className="p-6 bg-gray-50 rounded-3xl hover:bg-yellow-50 hover:scale-105 transition-all flex flex-col items-center gap-3 border-2 border-transparent hover:border-yellow-200"
                       >
                         <span className="text-5xl">{tmpl.icon}</span>
@@ -1075,6 +1220,7 @@ export default function App() {
                   </div>
                   <button 
                     onClick={() => setShowTemplates(false)}
+                    aria-label="Close coloring pages"
                     className="mt-8 w-full py-4 bg-gray-100 rounded-2xl font-bold text-gray-500 hover:bg-gray-200"
                   >
                     Close
@@ -1094,6 +1240,8 @@ export default function App() {
                   <button
                     key={color}
                     onClick={() => setCurrentColor(color)}
+                    aria-label={`Choose ${getColorLabel(color)} color`}
+                    aria-pressed={currentColor === color}
                     className="w-10 h-10 md:w-12 md:h-12 rounded-full transition-all border-4 shadow-sm shrink-0 relative overflow-hidden"
                     style={{ 
                       backgroundColor: color === 'RAINBOW' ? 'transparent' : color,
@@ -1120,6 +1268,8 @@ export default function App() {
                     setCurrentTexture(texture.id);
                     setCurrentTool('brush');
                   }}
+                  aria-label={`Use ${texture.label} brush style`}
+                  aria-pressed={currentTexture === texture.id && currentTool !== 'eraser'}
                   className={`px-3 py-2 md:p-2 rounded-xl text-xs font-bold transition-all border-2 shrink-0 md:w-full text-center ${
                     currentTexture === texture.id && currentTool !== 'eraser'
                       ? 'border-yellow-400 bg-yellow-50 text-yellow-700'
@@ -1138,6 +1288,8 @@ export default function App() {
               <button
                 key={size}
                 onClick={() => setBrushSize(size)}
+                aria-label={`Set brush size to ${size}`}
+                aria-pressed={brushSize === size}
                 className={`transition-all rounded-full border-2 shrink-0 ${
                   brushSize === size ? 'border-indigo-400 bg-indigo-50' : 'border-gray-100 bg-white'
                 } flex items-center justify-center`}
@@ -1172,12 +1324,20 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="gallery-title"
               className="bg-white p-6 md:p-8 rounded-[40px] shadow-2xl relative z-50 w-full max-w-4xl max-h-[90vh] flex flex-col"
             >
-              <h2 className="text-3xl font-black mb-6 text-center text-gray-800 flex items-center justify-center gap-3">
+              <h2 id="gallery-title" className="text-3xl font-black mb-6 text-center text-gray-800 flex items-center justify-center gap-3">
                 <FolderOpen size={32} className="text-pink-500" />
                 My Magical Art Gallery
               </h2>
+              {galleryError && (
+                <p role="alert" className="mb-4 rounded-2xl bg-amber-50 px-4 py-3 text-center text-sm font-bold text-amber-700">
+                  {galleryError}
+                </p>
+              )}
               
               <div className="flex-1 overflow-y-auto min-h-[300px]">
                 {savedArtworks.length === 0 ? (
@@ -1196,13 +1356,18 @@ export default function App() {
                             onClick={() => {
                               const img = new Image();
                               img.onload = () => {
-                                clearCanvas();
-                                canvasRef.current?.getContext('2d')?.drawImage(img, 0, 0);
+                                const canvas = canvasRef.current;
+                                const ctx = canvas?.getContext('2d');
+                                if (!canvas || !ctx) return;
+
+                                fillCanvasWhite(ctx, canvas);
+                                drawImageCentered(ctx, canvas, img);
                                 saveToHistory();
                                 setShowGallery(false);
                               };
                               img.src = url;
                             }}
+                            aria-label={`Load saved artwork ${i + 1}`}
                             className="bg-white text-gray-800 px-6 py-3 rounded-full font-bold shadow-xl hover:scale-110 active:scale-95 transition-all"
                           >
                             Load Canvas
@@ -1213,8 +1378,9 @@ export default function App() {
                             e.stopPropagation();
                             const newGallery = savedArtworks.filter((_, index) => index !== i);
                             setSavedArtworks(newGallery);
-                            localStorage.setItem('tinypaint-gallery', JSON.stringify(newGallery));
+                            setGalleryError(writeSavedArtworks(newGallery) ? null : 'Gallery storage could not be updated.');
                           }}
+                          aria-label={`Delete saved artwork ${i + 1}`}
                           className="absolute top-2 right-2 bg-white/80 p-2 rounded-full text-red-500 opacity-0 group-hover:opacity-100 hover:bg-red-500 hover:text-white transition-all shadow-sm"
                         >
                           <Trash2 size={16} />
@@ -1227,6 +1393,7 @@ export default function App() {
               
               <button 
                 onClick={() => setShowGallery(false)}
+                aria-label="Close art gallery"
                 className="mt-6 w-full py-4 bg-gray-100 rounded-2xl font-bold text-gray-600 hover:bg-gray-200 text-lg"
               >
                 Back to Drawing
