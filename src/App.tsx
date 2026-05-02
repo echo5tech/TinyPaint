@@ -89,25 +89,23 @@ export default function App() {
     const resizeCanvas = () => {
       const container = containerRef.current;
       if (!container) return;
-      
-      // Save current content
+  
+      // Save current content before resizing
       const tempImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      
+  
       const { width, height } = container.getBoundingClientRect();
       canvas.width = width;
       canvas.height = height;
-      
-      // Fill with white initially
+  
+      // Fill with white initially and restore content if history exists
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      
-      // Try to put back old content if we had any
+  
       if (historyIndex >= 0) {
-        // This is tricky on resize, usually for kids apps we just clear or keep fixed aspect
-        // For simplicity, let's just make it white for now or handle initial
+        // Restore the image data from the last saved state
+        ctx.putImageData(tempImageData, 0, 0);
       } else {
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // If no history, just fill with white and save this initial blank state
         saveToHistory();
       }
     };
@@ -117,6 +115,9 @@ export default function App() {
     return () => window.removeEventListener('resize', resizeCanvas);
   }, []);
 
+  // Use a ref to track the current history index so it's not stale in useCallback dependencies
+  const historyRef = useRef(historyIndex);
+
   const saveToHistory = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -125,13 +126,17 @@ export default function App() {
 
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const newState: HistoryState = { imageData };
-    
+
     setHistory(prev => {
-      const sliced = prev.slice(0, historyIndex + 1);
+      // Use the current index from the ref for slicing
+      const sliced = prev.slice(0, historyRef.current + 1);
       return [...sliced, newState].slice(-20); // Keep last 20 steps
     });
-    setHistoryIndex(prev => Math.min(prev + 1, 19));
-  }, [historyIndex]);
+    
+    // Update the ref and set the new index state
+    historyRef.current = Math.min(historyRef.current + 1, 19);
+    setHistoryIndex(historyRef.current);
+  }, []);
 
   const undo = () => {
     if (historyIndex <= 0) return;
